@@ -2,7 +2,7 @@
 """
 Fetch A-share and HK-listed companies with industry classification.
 
-A股 数据来源（官方交易所挂牌列表，非行情数据）:
+A股 数据来源（官方交易所挂牌列表）:
   深交所: stock_info_sz_name_code(symbol="A股列表")
           → 板块, A股代码, A股简称, A股上市日期, A股总股本, A股流通股本, 所属行业
   上交所: stock_info_sh_name_code(symbol="主板A股"|"科创板")
@@ -10,16 +10,15 @@ A股 数据来源（官方交易所挂牌列表，非行情数据）:
   北交所: stock_info_bj_name_code()
           → 证券代码, 证券简称, 总股本, 流通股本, 上市日期, 所属行业, 地区, 报告日期
 
-  SZ/BJ 的"所属行业"= CSRC证监会行业分类
-  SH 无行业列，CSRC留空；SW行业由板块迭代补充
-
 港股 数据来源:
-  stock_hk_main_board_spot_em() → 仅主板股票（排除权证/牛熊证/ETF）
-  → 序号, 代码, 名称, ... (无行业列，用公司名关键词兜底识别医疗)
+  HKEX 官方 ListOfSecurities.xlsx（含 Sub-Sector 行业分类）
+  → https://www.hkex.com.hk/eng/services/trading/securities/securitieslists/ListOfSecurities.xlsx
+  备用: stock_hk_main_board_spot_em()
 
 Output: ./output/
 """
 
+import io
 import logging
 import time
 from datetime import date
@@ -27,6 +26,7 @@ from pathlib import Path
 
 import akshare as ak
 import pandas as pd
+import requests
 
 OUTPUT_DIR = Path("output")
 
@@ -48,7 +48,7 @@ SW_L2_TO_L1: dict[str, str] = {
     "食品加工": "食品饮料", "调味发酵品": "食品饮料", "休闲食品": "食品饮料",
     "纺织制造": "纺织服装", "服装家纺": "纺织服装",
     "造纸": "轻工制造", "包装印刷": "轻工制造", "家具": "轻工制造", "其他轻工制造": "轻工制造",
-    # *** 医药生物 *** ← 医疗行业
+    # *** 医药生物 ***
     "化学制药": "医药生物", "生物制品": "医药生物", "医疗器械": "医药生物",
     "医疗服务": "医药生物", "中药": "医药生物", "医药商业": "医药生物",
     "电力": "公用事业", "燃气": "公用事业", "水务": "公用事业", "环境": "公用事业",
@@ -78,10 +78,24 @@ SW_L2_TO_L1: dict[str, str] = {
     "化妆品": "美容护理", "医疗美容": "美容护理", "个护用品": "美容护理",
 }
 
-HEALTHCARE_SW_L1    = {"医药生物"}
-HEALTHCARE_CSRC_KW  = ["医药", "医疗", "卫生"]   # 用于CSRC行业名称关键词匹配
-HEALTHCARE_HK_KW    = ["医疗", "医药", "健康", "生物", "制药", "药业", "药品",
-                        "health", "pharma", "bio", "medical"]
+HEALTHCARE_SW_L1   = {"医药生物"}
+HEALTHCARE_CSRC_KW = ["医药", "医疗", "卫生"]
+# HKEX Sub-Sector 中属于医疗/制药的分类（ICB体系）
+HEALTHCARE_HK_SECTORS = {
+    "Pharmaceuticals & Biotechnology",
+    "Health Care Equipment & Services",
+    "Pharmaceuticals, Biotechnology & Life Sciences",
+    "Health Care",
+    "Biotechnology",
+    "Pharmaceuticals",
+    "Medical Equipment & Services",
+    "Biotechnology & Medical Research",
+}
+
+HKEX_XLSX_URL = (
+    "https://www.hkex.com.hk/eng/services/trading/securities/"
+    "securitieslists/ListOfSecurities.xlsx"
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-8s %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger(__name__)
@@ -99,53 +113,49 @@ def _retry(fn, retries=3, base_delay=1.0):
 
 
 # ---------------------------------------------------------------------------
-# A股 官方挂牌列表（深交所 + 上交所 + 北交所）
+# A股 官方挂牌列表
 # ---------------------------------------------------------------------------
 
 def fetch_a_official() -> pd.DataFrame:
-    """
-    从三大交易所官方API获取A股挂牌列表（精确计数，含CSRC行业）。
-    SZ/BJ 有 所属行业 列（CSRC行业）；SH 无行业列。
-    """
     log.info("=== A股 官方挂牌列表 ===")
     frames = []
 
-    # ── 深交所 (有行业) ──────────────────────────────────────────────────
+    # 深交所 (有行业)
     try:
         df = _retry(lambda: ak.stock_info_sz_name_code(symbol="A股列表"))
         log.info(f"  深交所: {len(df):,} 家 | 列: {df.columns.tolist()}")
         frames.append(pd.DataFrame({
-            "stock_code":        df["A股代码"].astype(str).str.zfill(6),
-            "company_name":      df["A股简称"].astype(str),
+            "stock_code":         df["A股代码"].astype(str).str.zfill(6),
+            "company_name":       df["A股简称"].astype(str),
             "csrc_industry_name": df["所属行业"].astype(str),
-            "exchange":          "SZ",
+            "exchange":           "SZ",
         }))
     except Exception as e:
         log.error(f"  深交所 失败: {e}")
 
-    # ── 上交所 主板 + 科创板 (无行业) ────────────────────────────────────
+    # 上交所 主板 + 科创板 (无行业)
     for segment in ["主板A股", "科创板"]:
         try:
             df = _retry(lambda s=segment: ak.stock_info_sh_name_code(symbol=s))
             log.info(f"  上交所 {segment}: {len(df):,} 家 | 列: {df.columns.tolist()}")
             frames.append(pd.DataFrame({
-                "stock_code":        df["证券代码"].astype(str).str.zfill(6),
-                "company_name":      df["证券简称"].astype(str),
-                "csrc_industry_name": "",   # 上交所该接口不提供行业
-                "exchange":          "SH",
+                "stock_code":         df["证券代码"].astype(str).str.zfill(6),
+                "company_name":       df["证券简称"].astype(str),
+                "csrc_industry_name": "",
+                "exchange":           "SH",
             }))
         except Exception as e:
             log.error(f"  上交所 {segment} 失败: {e}")
 
-    # ── 北交所 (有行业) ──────────────────────────────────────────────────
+    # 北交所 (有行业)
     try:
         df = _retry(lambda: ak.stock_info_bj_name_code())
         log.info(f"  北交所: {len(df):,} 家 | 列: {df.columns.tolist()}")
         frames.append(pd.DataFrame({
-            "stock_code":        df["证券代码"].astype(str).str.zfill(6),
-            "company_name":      df["证券简称"].astype(str),
+            "stock_code":         df["证券代码"].astype(str).str.zfill(6),
+            "company_name":       df["证券简称"].astype(str),
             "csrc_industry_name": df["所属行业"].astype(str),
-            "exchange":          "BJ",
+            "exchange":           "BJ",
         }))
     except Exception as e:
         log.error(f"  北交所 失败: {e}")
@@ -160,7 +170,7 @@ def fetch_a_official() -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# A股 申万行业（东方财富行业板块，只取已知SW二级名称）
+# A股 申万行业
 # ---------------------------------------------------------------------------
 
 def fetch_sw_map() -> dict[str, tuple[str, str]]:
@@ -184,12 +194,10 @@ def fetch_sw_map() -> dict[str, tuple[str, str]]:
         l1 = SW_L2_TO_L1[l2]
         try:
             cons = _retry(lambda b=l2: ak.stock_board_industry_cons_em(symbol=b))
-            # 文档确认: 序号在col[0], 代码在col[1] 且列名为"代码"
-            added = sum(
-                1 for code in cons["代码"].astype(str).str.zfill(6)
-                if code.isdigit() and (code_map.__setitem__(code, (l1, l2)) or True)
-            )
-            log.info(f"  [{i:>2}/{len(sw_names)}] {l2:14s}({l1}) {added}只")
+            for code in cons["代码"].astype(str).str.zfill(6):
+                if code.isdigit():
+                    code_map[code] = (l1, l2)
+            log.info(f"  [{i:>2}/{len(sw_names)}] {l2:14s}({l1}) {len(cons)}只")
         except Exception as e:
             log.warning(f"  板块 '{l2}' 失败: {e}")
         time.sleep(0.3)
@@ -210,10 +218,9 @@ def build_a_stocks(official_df: pd.DataFrame, sw_map: dict) -> pd.DataFrame:
     df["sw_industry_l1"] = df["stock_code"].map(lambda c: sw_map.get(c, ("", ""))[0])
     df["sw_industry_l2"] = df["stock_code"].map(lambda c: sw_map.get(c, ("", ""))[1])
     df["market"]             = "A"
-    df["csrc_industry_code"] = ""   # 三大交易所接口均不提供CSRC代码，只有名称
+    df["csrc_industry_code"] = ""
     df["hk_industry"]        = ""
 
-    # 医疗判断：SW一级=医药生物，或CSRC行业名含关键词
     sw_hc   = df["sw_industry_l1"].isin(HEALTHCARE_SW_L1)
     csrc_hc = df["csrc_industry_name"].apply(
         lambda x: any(kw in str(x) for kw in HEALTHCARE_CSRC_KW)
@@ -230,36 +237,124 @@ def build_a_stocks(official_df: pd.DataFrame, sw_map: dict) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# 港股（主板，排除权证/牛熊证等结构产品）
+# 港股 — 首选: HKEX 官方 ListOfSecurities.xlsx（含 Sub-Sector 行业）
 # ---------------------------------------------------------------------------
+
+def _find_header_row(raw: pd.DataFrame) -> int:
+    """找到包含 'Stock Code' 或 '股份代號' 的行号作为表头"""
+    for i, row in raw.iterrows():
+        vals = [str(v).strip() for v in row.values if pd.notna(v)]
+        if any("Stock Code" in v or "股份代號" in v for v in vals):
+            return i
+    raise ValueError(f"找不到表头行，前5行内容:\n{raw.head(5).to_string()}")
+
+
+def _find_col(df: pd.DataFrame, *keywords) -> str | None:
+    """在 df.columns 中找第一个包含任意关键词的列名"""
+    for col in df.columns:
+        c = str(col).strip()
+        if any(kw.lower() in c.lower() for kw in keywords):
+            return col
+    return None
+
+
+def fetch_hk_from_hkex() -> pd.DataFrame:
+    """
+    从 HKEX 官方 ListOfSecurities.xlsx 获取港股列表及行业分类。
+    文件包含所有上市证券（股票/权证/牛熊证/ETF等），过滤到 Equity 类型。
+    Sub-Sector 列为 HKEX 行业分类（ICB 体系）。
+    """
+    log.info(f"  下载 HKEX ListOfSecurities.xlsx ...")
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,*/*",
+        "Referer": "https://www.hkex.com.hk/",
+    }
+    resp = requests.get(HKEX_XLSX_URL, headers=headers, timeout=60)
+    resp.raise_for_status()
+    log.info(f"  下载成功: {len(resp.content):,} bytes")
+
+    content = resp.content
+
+    # 先读全文不带表头，找表头所在行
+    raw = pd.read_excel(io.BytesIO(content), header=None, sheet_name=0)
+    log.info(f"  原始表格: {raw.shape[0]} 行 × {raw.shape[1]} 列")
+    log.info(f"  前4行内容:\n{raw.head(4).to_string()}")
+
+    header_row = _find_header_row(raw)
+    log.info(f"  表头在第 {header_row} 行")
+
+    df = pd.read_excel(io.BytesIO(content), header=header_row, sheet_name=0)
+    log.info(f"  解析后列名: {df.columns.tolist()}")
+
+    # 定位各列
+    code_col     = _find_col(df, "Stock Code", "股份代號")
+    name_en_col  = _find_col(df, "Name of Listed Company")
+    category_col = _find_col(df, "Category", "類別")
+    sector_col   = _find_col(df, "Sub-Sector", "Sub Sector", "Subsector", "行業")
+
+    log.info(f"  code={code_col}, name={name_en_col}, category={category_col}, sector={sector_col}")
+
+    if not code_col:
+        raise ValueError(f"找不到股份代號列，实际列名: {df.columns.tolist()}")
+
+    # 过滤到 Equity Securities（股票），排除权证/牛熊证/ETF等
+    if category_col:
+        equity_mask = df[category_col].astype(str).str.contains(
+            r"Equity|股份", case=False, na=False
+        )
+        df = df[equity_mask].reset_index(drop=True)
+        log.info(f"  过滤 Equity 后: {len(df):,} 家")
+
+    codes = df[code_col].astype(str).str.strip().str.extract(r"(\d+)")[0].str.zfill(5)
+
+    result = pd.DataFrame({
+        "stock_code":   codes,
+        "company_name": df[name_en_col].astype(str).str.strip() if name_en_col else "",
+        "hk_industry":  df[sector_col].astype(str).str.strip() if sector_col else "",
+    })
+
+    result = result[result["stock_code"].str.fullmatch(r"\d{5}")]
+    result = result[result["stock_code"] != "00000"]
+    result = result.drop_duplicates("stock_code").reset_index(drop=True)
+
+    log.info(f"  港股（Equity）: {len(result):,} 家")
+    if sector_col:
+        top_sectors = result["hk_industry"].value_counts().head(10)
+        log.info(f"  行业分布前10:\n{top_sectors.to_string()}")
+
+    return result
+
 
 def fetch_hk_stocks() -> pd.DataFrame:
     """
-    stock_hk_main_board_spot_em() 只返回港交所主板股票。
-    列名: 序号, 代码, 名称, ... (无行业列)
+    港股列表 + 行业分类。
+    优先从 HKEX 官方 xlsx 获取（含真实 Sub-Sector 行业）。
+    失败时退回 AKShare stock_hk_main_board_spot_em()（无行业列）。
     """
-    log.info("=== 港股 主板挂牌列表 (stock_hk_main_board_spot_em) ===")
+    log.info("=== 港股 挂牌列表 ===")
+
+    try:
+        return fetch_hk_from_hkex()
+    except Exception as e:
+        log.warning(f"  HKEX xlsx 失败: {e}")
+        log.warning("  退回 AKShare stock_hk_main_board_spot_em()（无行业分类）...")
+
     try:
         df = _retry(lambda: ak.stock_hk_main_board_spot_em())
-        log.info(f"  港股主板: {len(df):,} 家 | 列: {df.columns.tolist()}")
-    except Exception as e:
-        log.warning(f"  主板接口失败 ({e})，尝试全量接口+过滤...")
-        try:
-            df = _retry(lambda: ak.stock_hk_spot_em())
-            # 过滤：只保留主板(00001-03999)和GEM(08001-09999)代码
-            codes = df["代码"].astype(str).str.strip()
-            mask  = codes.apply(lambda c: c.isdigit() and (int(c) <= 3999 or 8001 <= int(c) <= 9999))
-            df    = df[mask].reset_index(drop=True)
-            log.info(f"  全量过滤后: {len(df):,} 家")
-        except Exception as e2:
-            log.error(f"  全量接口也失败: {e2}")
-            return pd.DataFrame()
-
-    return pd.DataFrame({
-        "stock_code":   df["代码"].astype(str).str.strip(),
-        "company_name": df["名称"].astype(str).str.strip(),
-        "hk_industry":  "",   # 港交所主板接口无行业列
-    })
+        log.info(f"  AKShare 港股主板: {len(df):,} 家 | 列: {df.columns.tolist()}")
+        return pd.DataFrame({
+            "stock_code":   df["代码"].astype(str).str.strip().str.zfill(5),
+            "company_name": df["名称"].astype(str).str.strip(),
+            "hk_industry":  "",
+        })
+    except Exception as e2:
+        log.error(f"  AKShare 港股接口也失败: {e2}")
+        return pd.DataFrame()
 
 
 def build_hk_stocks(hk_df: pd.DataFrame) -> pd.DataFrame:
@@ -273,11 +368,13 @@ def build_hk_stocks(hk_df: pd.DataFrame) -> pd.DataFrame:
     df["csrc_industry_code"] = ""
     df["csrc_industry_name"] = ""
 
-    # 港股无行业数据，用公司名关键词识别医疗
-    name_low = df["company_name"].str.lower().fillna("")
-    df["is_healthcare"] = name_low.apply(
-        lambda x: int(any(kw.lower() in x for kw in HEALTHCARE_HK_KW))
-    )
+    if df["hk_industry"].str.strip().ne("").any():
+        df["is_healthcare"] = df["hk_industry"].isin(HEALTHCARE_HK_SECTORS).astype(int)
+        log.info(f"  港股医疗（Sub-Sector 精确匹配）: {df['is_healthcare'].sum():,} 家")
+    else:
+        df["is_healthcare"] = 0
+        log.warning("  港股行业数据为空，is_healthcare 全部设为 0")
+
     df["updated_at"] = date.today().isoformat()
 
     return df[[
@@ -312,9 +409,9 @@ def main():
     a_path   = OUTPUT_DIR / f"a_stocks_{today}.csv"
     hk_path  = OUTPUT_DIR / f"hk_stocks_{today}.csv"
     all_path = OUTPUT_DIR / f"all_stocks_{today}.csv"
-    a_df.to_csv(a_path,    index=False, encoding="utf-8")
-    hk_df.to_csv(hk_path,  index=False, encoding="utf-8")
-    all_df.to_csv(all_path, index=False, encoding="utf-8")
+    a_df.to_csv(a_path,    index=False, encoding="utf-8-sig")
+    hk_df.to_csv(hk_path,  index=False, encoding="utf-8-sig")
+    all_df.to_csv(all_path, index=False, encoding="utf-8-sig")
 
     a_hc  = int(a_df["is_healthcare"].sum())  if not a_df.empty  else 0
     hk_hc = int(hk_df["is_healthcare"].sum()) if not hk_df.empty else 0
@@ -331,7 +428,10 @@ def main():
     if not hk_df.empty:
         log.info(f"{'港股':<6} {hk_hc:>6,} {len(hk_df)-hk_hc:>8,} {len(hk_df):>8,}")
     log.info(f"{'合计':<6} {a_hc+hk_hc:>6,} {total-(a_hc+hk_hc):>8,} {total:>8,}")
-    log.info(f"\n文件: {OUTPUT_DIR.resolve()}/")
+    log.info(f"\n文件已保存至: {OUTPUT_DIR.resolve()}/")
+    log.info(f"  {a_path.name}")
+    log.info(f"  {hk_path.name}")
+    log.info(f"  {all_path.name}")
 
 
 if __name__ == "__main__":
